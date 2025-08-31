@@ -1,24 +1,33 @@
-use std::{collections::{HashMap, VecDeque}, time::Duration};
+use std::{
+    collections::{HashMap, VecDeque},
+    time::Duration,
+};
 
 use anyhow::Context;
 use btleplug::api::{
-    Central, CentralEvent, Manager as _, Peripheral as _, ScanFilter,
-    AdvertisingOptions, AdvertisementData,
+    AdvertisementData, AdvertisingOptions, Central, CentralEvent, Manager as _, Peripheral as _,
+    ScanFilter,
 };
 use btleplug::platform::Manager;
 use clap::{Parser, Subcommand};
 use rand::Rng;
 use tokio::{select, time::sleep};
 
+mod rate_limiter;
+use rate_limiter::RateLimiter;
+
 const COMPANY_ID: u16 = 0xFFFF; // experimental/manufacturer data key
 const VER: u8 = 1;
 const MAX_PAYLOAD: usize = 20; // leave header room; BLE legacy adv ~31B total
 
 #[derive(Parser, Debug)]
-#[command(name="ble-chirp", about="Broadcast/scan tiny messages via BLE advertising (mesh-style)")]
+#[command(
+    name = "ble-chirp",
+    about = "Broadcast/scan tiny messages via BLE advertising (mesh-style)"
+)]
 struct Args {
     /// Which adapter index to use (0 by default)
-    #[arg(long, default_value_t=0)]
+    #[arg(long, default_value_t = 0)]
     adapter: usize,
     #[command(subcommand)]
     cmd: Cmd,
@@ -29,16 +38,19 @@ enum Cmd {
     /// Transmit a message (advertise chunked frames)
     Tx {
         /// Topic/channel (0-255)
-        #[arg(long, default_value_t=7)]
+        #[arg(long, default_value_t = 7)]
         topic: u8,
         /// Hops to relay
-        #[arg(long, default_value_t=3)]
+        #[arg(long, default_value_t = 3)]
         ttl: u8,
         /// Message text
         msg: String,
         /// Milliseconds to advertise each chunk
-        #[arg(long, default_value_t=500)]
+        #[arg(long, default_value_t = 500)]
         dwell_ms: u64,
+        /// Max chunks per second
+        #[arg(long, default_value_t = 2.0)]
+        rate: f64,
     },
     /// Receive & show messages; optionally relay them
     Rx {
@@ -46,9 +58,9 @@ enum Cmd {
         #[arg(long)]
         topic: Option<u8>,
         /// Relay chunks with TTL-1 (gossip)
-        #[arg(long, default_value_t=true)]
+        #[arg(long, default_value_t = true)]
         relay: bool,
-    }
+    },
 }
 
 #[derive(Clone)]
@@ -76,18 +88,31 @@ fn pack_frame(f: &Frame) -> Vec<u8> {
 }
 
 fn unpack_frame(md: &[u8]) -> Option<Frame> {
-    if md.len() < 2 + 1 + 1 + 1 + 4 + 1 + 1 { return None; }
+    if md.len() < 2 + 1 + 1 + 1 + 4 + 1 + 1 {
+        return None;
+    }
     let cid = u16::from_le_bytes([md[0], md[1]]);
-    if cid != COMPANY_ID { return None; }
+    if cid != COMPANY_ID {
+        return None;
+    }
     let ver = md[2];
-    if ver != VER { return None; }
+    if ver != VER {
+        return None;
+    }
     let topic = md[3];
     let ttl = md[4];
     let msg_id = [md[5], md[6], md[7], md[8]];
     let seq = md[9];
     let tot = md[10];
     let payload = md[11..].to_vec();
-    Some(Frame { topic, ttl, msg_id, seq, tot, payload })
+    Some(Frame {
+        topic,
+        ttl,
+        msg_id,
+        seq,
+        tot,
+        payload,
+    })
 }
 
 fn chunk_message(bytes: &[u8]) -> Vec<(u8, u8, Vec<u8>)> {
@@ -107,12 +132,19 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let manager = Manager::new().await.context("btleplug Manager::new")?;
     let adapters = manager.adapters().await.context("list adapters")?;
-    let adapter = adapters.get(args.adapter)
+    let adapter = adapters
+        .get(args.adapter)
         .ok_or_else(|| anyhow::anyhow!("adapter {} not found", args.adapter))?
         .clone();
 
     match args.cmd {
-        Cmd::Tx { topic, ttl, msg, dwell_ms } => tx(adapter, topic, ttl, &msg, dwell_ms).await?,
+        Cmd::Tx {
+            topic,
+            ttl,
+            msg,
+            dwell_ms,
+            rate,
+        } => tx(adapter, topic, ttl, &msg, dwell_ms, rate).await?,
         Cmd::Rx { topic, relay } => rx(adapter, topic, relay).await?,
     }
     Ok(())
@@ -120,16 +152,35 @@ async fn main() -> anyhow::Result<()> {
 
 async fn tx(
     adapter: btleplug::platform::Adapter,
-    topic: u8, ttl: u8, msg: &str, dwell_ms: u64
+    topic: u8,
+    ttl: u8,
+    msg: &str,
+    dwell_ms: u64,
+    rate: f64,
 ) -> anyhow::Result<()> {
     let msg_bytes = msg.as_bytes();
     let chunks = chunk_message(msg_bytes);
     let peripheral = adapter.peripheral().await.context("create peripheral")?;
-    let msg_id: [u8;4] = rand::thread_rng().gen();
-    println!("TX topic={} ttl={} chunks={} msg_id={:02x?}", topic, ttl, chunks.len(), msg_id);
+    let msg_id: [u8; 4] = rand::thread_rng().r#gen();
+    println!(
+        "TX topic={} ttl={} chunks={} msg_id={:02x?}",
+        topic,
+        ttl,
+        chunks.len(),
+        msg_id
+    );
 
+    let mut rl = RateLimiter::new(rate);
     for (seq, tot, payload) in chunks {
-        let f = Frame { topic, ttl, msg_id, seq, tot, payload };
+        rl.acquire().await;
+        let f = Frame {
+            topic,
+            ttl,
+            msg_id,
+            seq,
+            tot,
+            payload,
+        };
         let md = pack_frame(&f);
         let mut m = HashMap::new();
         m.insert(COMPANY_ID, md);
@@ -144,7 +195,9 @@ async fn tx(
             solicited_services: None,
         };
 
-        peripheral.start_advertising(adv, AdvertisingOptions::default()).await?;
+        peripheral
+            .start_advertising(adv, AdvertisingOptions::default())
+            .await?;
         sleep(Duration::from_millis(dwell_ms)).await;
         peripheral.stop_advertising().await?;
         sleep(Duration::from_millis(60)).await; // small gap between chunks
@@ -155,37 +208,59 @@ async fn tx(
 
 async fn rx(
     adapter: btleplug::platform::Adapter,
-    topic_filter: Option<u8>, relay: bool
+    topic_filter: Option<u8>,
+    relay: bool,
 ) -> anyhow::Result<()> {
     // de-dupe cache: seen (msg_id, seq)
-    let mut seen: VecDeque<([u8;4], u8)> = VecDeque::with_capacity(2048);
-    let mut reasm: HashMap<[u8;4], (u8, HashMap<u8, Vec<u8>>, u8)> = HashMap::new();
+    let mut seen: VecDeque<([u8; 4], u8)> = VecDeque::with_capacity(2048);
+    let mut reasm: HashMap<[u8; 4], (u8, HashMap<u8, Vec<u8>>, u8)> = HashMap::new();
     //                               tot,    parts(seq->payload), topic
 
     adapter.start_scan(ScanFilter::default()).await?;
-    println!("Listening... {}", topic_filter.map(|t| format!("(topic={})", t)).unwrap_or_default());
+    println!(
+        "Listening... {}",
+        topic_filter
+            .map(|t| format!("(topic={})", t))
+            .unwrap_or_default()
+    );
 
     let mut events = adapter.events().await?;
     while let Some(evt) = events.recv().await {
-        if let CentralEvent::ManufacturerDataAdvertisement { manufacturer_data, .. } = evt {
+        if let CentralEvent::ManufacturerDataAdvertisement {
+            manufacturer_data, ..
+        } = evt
+        {
             if let Some(md) = manufacturer_data.get(&COMPANY_ID) {
                 if let Some(mut f) = unpack_frame(md) {
-                    if let Some(t) = topic_filter { if f.topic != t { continue; } }
+                    if let Some(t) = topic_filter {
+                        if f.topic != t {
+                            continue;
+                        }
+                    }
 
                     // de-dupe (msg_id, seq)
-                    if seen.iter().any(|(id, s)| *id==f.msg_id && *s==f.seq) { continue; }
-                    if seen.len() >= 2048 { seen.pop_front(); }
+                    if seen.iter().any(|(id, s)| *id == f.msg_id && *s == f.seq) {
+                        continue;
+                    }
+                    if seen.len() >= 2048 {
+                        seen.pop_front();
+                    }
                     seen.push_back((f.msg_id, f.seq));
 
                     // reassembly
-                    let entry = reasm.entry(f.msg_id)
+                    let entry = reasm
+                        .entry(f.msg_id)
                         .or_insert_with(|| (f.tot, HashMap::new(), f.topic));
                     entry.1.insert(f.seq, f.payload.clone());
 
                     // complete?
                     if entry.1.len() as u8 == entry.0 {
                         let mut bytes = Vec::new();
-                        for i in 0..entry.0 { if let Some(p) = entry.1.get(&i) { bytes.extend_from_slice(p); } }
+                        for i in 0..entry.0 {
+                            if let Some(p) = entry.1.get(&i) {
+                                bytes.extend_from_slice(p);
+                            }
+                        }
                         let text = String::from_utf8_lossy(&bytes);
                         let id8 = hex::encode(f.msg_id);
                         println!("[topic {}] #{}: {}", entry.2, &id8[..8], text);
@@ -209,7 +284,10 @@ async fn do_relay(adapter: btleplug::platform::Adapter, f: Frame, backoff_ms: u6
     sleep(Duration::from_millis(backoff_ms)).await;
     let peripheral = match adapter.peripheral().await {
         Ok(p) => p,
-        Err(e) => { eprintln!("relay peripheral err: {e}"); return; }
+        Err(e) => {
+            eprintln!("relay peripheral err: {e}");
+            return;
+        }
     };
     let mut m = HashMap::new();
     m.insert(COMPANY_ID, pack_frame(&f));
@@ -222,7 +300,10 @@ async fn do_relay(adapter: btleplug::platform::Adapter, f: Frame, backoff_ms: u6
         tx_power_level: None,
         solicited_services: None,
     };
-    if let Err(e) = peripheral.start_advertising(adv, AdvertisingOptions::default()).await {
+    if let Err(e) = peripheral
+        .start_advertising(adv, AdvertisingOptions::default())
+        .await
+    {
         eprintln!("relay start adv err: {e}");
         return;
     }
