@@ -1,6 +1,7 @@
 use std::time::Duration;
 use tokio::time::{Instant, sleep};
 
+/// Simple token-bucket rate limiter.
 pub struct RateLimiter {
     capacity: f64,
     tokens: f64,
