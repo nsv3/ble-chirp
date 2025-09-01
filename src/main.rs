@@ -1,4 +1,6 @@
+
 use sha2::{Digest, Sha256};
+
 use std::{
     collections::{HashMap, VecDeque},
     time::Duration,
@@ -16,6 +18,8 @@ use tokio::time::sleep;
 
 mod chat_ui;
 
+mod crypto;
+
 const COMPANY_ID: u16 = 0xFFFF; // experimental/manufacturer data key
 const VER: u8 = 1;
 const MAX_PAYLOAD: usize = 20; // leave header room; BLE legacy adv ~31B total
@@ -29,6 +33,9 @@ struct Args {
     /// Which adapter index to use (0 by default)
     #[arg(long, default_value_t = 0)]
     adapter: usize,
+    /// Passphrase for payload encryption/decryption
+    #[arg(long)]
+    passphrase: Option<String>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -64,6 +71,7 @@ enum Cmd {
         #[arg(long, default_value_t = true)]
         relay: bool,
     },
+
     /// Interactive terminal UI chat mode
     Chat {
         /// Topic/channel (0-255)
@@ -159,9 +167,12 @@ async fn main() -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("adapter {} not found", args.adapter))?
         .clone();
 
+    let key = args.passphrase.as_ref().map(|p| crypto::derive_key(p));
+
     match args.cmd {
         Cmd::Tx {
             topic,
+
             room,
             ttl,
             msg,
@@ -243,6 +254,7 @@ pub(crate) async fn rx_loop<F>(
     adapter: btleplug::platform::Adapter,
     topic_filter: Option<u8>,
     relay: bool,
+
     mut on_msg: F,
 ) -> anyhow::Result<()>
 where
@@ -284,11 +296,20 @@ where
                     }
                     seen.push_back((f.msg_id, f.seq));
 
+                    // decrypt if needed
+                    let mut payload = f.payload.clone();
+                    if let Some(ref k) = key {
+                        match crypto::decrypt(k, &f.msg_id, f.seq, &f.payload) {
+                            Ok(p) => payload = p,
+                            Err(_) => continue,
+                        }
+                    }
+
                     // reassembly
                     let entry = reasm
                         .entry(f.msg_id)
                         .or_insert_with(|| (f.tot, HashMap::new(), f.topic));
-                    entry.1.insert(f.seq, f.payload.clone());
+                    entry.1.insert(f.seq, payload);
 
                     // complete?
                     if entry.1.len() as u8 == entry.0 {
@@ -298,8 +319,10 @@ where
                                 bytes.extend_from_slice(p);
                             }
                         }
+
                         let text = String::from_utf8_lossy(&bytes).to_string();
                         on_msg(entry.2, f.msg_id, text.clone());
+
                         reasm.remove(&f.msg_id);
                     }
 
