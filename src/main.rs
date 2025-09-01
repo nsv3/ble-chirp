@@ -1,3 +1,8 @@
+
+
+use sha2::{Digest, Sha256};
+
+
 use std::{
     collections::{HashMap, VecDeque},
     time::Duration,
@@ -11,7 +16,11 @@ use btleplug::api::{
 use btleplug::platform::Manager;
 use clap::{Parser, Subcommand};
 use rand::Rng;
-use tokio::{select, time::sleep};
+use tokio::time::sleep;
+
+mod chat_ui;
+
+mod crypto;
 
 mod rate_limiter;
 use rate_limiter::RateLimiter;
@@ -29,6 +38,9 @@ struct Args {
     /// Which adapter index to use (0 by default)
     #[arg(long, default_value_t = 0)]
     adapter: usize,
+    /// Passphrase for payload encryption/decryption
+    #[arg(long)]
+    passphrase: Option<String>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -38,8 +50,12 @@ enum Cmd {
     /// Transmit a message (advertise chunked frames)
     Tx {
         /// Topic/channel (0-255)
-        #[arg(long, default_value_t = 7)]
+
+        #[arg(long, default_value_t = 7, conflicts_with = "room")]
         topic: u8,
+        /// Human-friendly room name
+        #[arg(long)]
+        room: Option<String>,
         /// Hops to relay
         #[arg(long, default_value_t = 3)]
         ttl: u8,
@@ -55,11 +71,27 @@ enum Cmd {
     /// Receive & show messages; optionally relay them
     Rx {
         /// Only show a specific topic
-        #[arg(long)]
+        #[arg(long, conflicts_with = "room")]
         topic: Option<u8>,
+        /// Human-friendly room name to filter by
+        #[arg(long)]
+        room: Option<String>,
         /// Relay chunks with TTL-1 (gossip)
         #[arg(long, default_value_t = true)]
         relay: bool,
+    },
+
+    /// Interactive terminal UI chat mode
+    Chat {
+        /// Topic/channel (0-255)
+        #[arg(long, default_value_t = 7, conflicts_with = "room")]
+        topic: u8,
+        /// Human-friendly room name
+        #[arg(long)]
+        room: Option<String>,
+        /// Hops to relay for our sent messages
+        #[arg(long, default_value_t = 3)]
+        ttl: u8,
     },
 }
 
@@ -127,6 +159,13 @@ fn chunk_message(bytes: &[u8]) -> Vec<(u8, u8, Vec<u8>)> {
     v
 }
 
+fn topic_from_room(room: &str) -> u8 {
+    let mut h = Sha256::new();
+    h.update(room.as_bytes());
+    let digest = h.finalize();
+    digest[0]
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
@@ -137,26 +176,43 @@ async fn main() -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("adapter {} not found", args.adapter))?
         .clone();
 
+    let key = args.passphrase.as_ref().map(|p| crypto::derive_key(p));
+
     match args.cmd {
         Cmd::Tx {
             topic,
+            room,
             ttl,
             msg,
             dwell_ms,
-            rate,
-        } => tx(adapter, topic, ttl, &msg, dwell_ms, rate).await?,
-        Cmd::Rx { topic, relay } => rx(adapter, topic, relay).await?,
+        } => {
+            let topic = room.map_or(topic, |r| topic_from_room(&r));
+            tx(adapter, topic, ttl, &msg, dwell_ms).await?
+        }
+        Cmd::Rx { topic, room, relay } => {
+            let topic = match (topic, room) {
+                (Some(t), _) => Some(t),
+                (_, Some(r)) => Some(topic_from_room(&r)),
+                _ => None,
+            };
+            rx(adapter, topic, relay).await?
+        }
+        Cmd::Chat { topic, room, ttl } => {
+            let topic = room.map_or(topic, |r| topic_from_room(&r));
+            chat_ui::chat(adapter, topic, ttl).await?
+        }
     }
     Ok(())
 }
 
-async fn tx(
+pub(crate) async fn tx(
     adapter: btleplug::platform::Adapter,
     topic: u8,
     ttl: u8,
     msg: &str,
     dwell_ms: u64,
     rate: f64,
+
 ) -> anyhow::Result<()> {
     let msg_bytes = msg.as_bytes();
     let chunks = chunk_message(msg_bytes);
@@ -206,11 +262,17 @@ async fn tx(
     Ok(())
 }
 
-async fn rx(
+pub(crate) async fn rx_loop<F>(
     adapter: btleplug::platform::Adapter,
     topic_filter: Option<u8>,
     relay: bool,
-) -> anyhow::Result<()> {
+
+
+    mut on_msg: F,
+) -> anyhow::Result<()>
+where
+    F: FnMut(u8, [u8; 4], String) + Send + 'static,
+{
     // de-dupe cache: seen (msg_id, seq)
     let mut seen: VecDeque<([u8; 4], u8)> = VecDeque::with_capacity(2048);
     let mut reasm: HashMap<[u8; 4], (u8, HashMap<u8, Vec<u8>>, u8)> = HashMap::new();
@@ -247,11 +309,20 @@ async fn rx(
                     }
                     seen.push_back((f.msg_id, f.seq));
 
+                    // decrypt if needed
+                    let mut payload = f.payload.clone();
+                    if let Some(ref k) = key {
+                        match crypto::decrypt(k, &f.msg_id, f.seq, &f.payload) {
+                            Ok(p) => payload = p,
+                            Err(_) => continue,
+                        }
+                    }
+
                     // reassembly
                     let entry = reasm
                         .entry(f.msg_id)
                         .or_insert_with(|| (f.tot, HashMap::new(), f.topic));
-                    entry.1.insert(f.seq, f.payload.clone());
+                    entry.1.insert(f.seq, payload);
 
                     // complete?
                     if entry.1.len() as u8 == entry.0 {
@@ -261,6 +332,7 @@ async fn rx(
                                 bytes.extend_from_slice(p);
                             }
                         }
+
                         let text = String::from_utf8_lossy(&bytes);
                         let id8 = hex::encode(f.msg_id);
                         println!("[topic {}] #{}: {}", entry.2, &id8[..8], text);
@@ -278,6 +350,18 @@ async fn rx(
         }
     }
     Ok(())
+}
+
+async fn rx(
+    adapter: btleplug::platform::Adapter,
+    topic_filter: Option<u8>,
+    relay: bool,
+) -> anyhow::Result<()> {
+    rx_loop(adapter, topic_filter, relay, |topic, id, text| {
+        let id8 = hex::encode(id);
+        println!("[topic {}] #{}: {}", topic, &id8[..8], text);
+    })
+    .await
 }
 
 async fn do_relay(adapter: btleplug::platform::Adapter, f: Frame, backoff_ms: u64) {
