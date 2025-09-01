@@ -1,5 +1,7 @@
 
+
 use sha2::{Digest, Sha256};
+
 
 use std::{
     collections::{HashMap, VecDeque},
@@ -19,6 +21,9 @@ use tokio::time::sleep;
 mod chat_ui;
 
 mod crypto;
+
+mod rate_limiter;
+use rate_limiter::RateLimiter;
 
 const COMPANY_ID: u16 = 0xFFFF; // experimental/manufacturer data key
 const VER: u8 = 1;
@@ -45,6 +50,7 @@ enum Cmd {
     /// Transmit a message (advertise chunked frames)
     Tx {
         /// Topic/channel (0-255)
+
         #[arg(long, default_value_t = 7, conflicts_with = "room")]
         topic: u8,
         /// Human-friendly room name
@@ -58,6 +64,9 @@ enum Cmd {
         /// Milliseconds to advertise each chunk
         #[arg(long, default_value_t = 500)]
         dwell_ms: u64,
+        /// Max chunks per second
+        #[arg(long, default_value_t = 2.0)]
+        rate: f64,
     },
     /// Receive & show messages; optionally relay them
     Rx {
@@ -172,7 +181,6 @@ async fn main() -> anyhow::Result<()> {
     match args.cmd {
         Cmd::Tx {
             topic,
-
             room,
             ttl,
             msg,
@@ -203,6 +211,8 @@ pub(crate) async fn tx(
     ttl: u8,
     msg: &str,
     dwell_ms: u64,
+    rate: f64,
+
 ) -> anyhow::Result<()> {
     let msg_bytes = msg.as_bytes();
     let chunks = chunk_message(msg_bytes);
@@ -216,7 +226,9 @@ pub(crate) async fn tx(
         msg_id
     );
 
+    let mut rl = RateLimiter::new(rate);
     for (seq, tot, payload) in chunks {
+        rl.acquire().await;
         let f = Frame {
             topic,
             ttl,
@@ -254,6 +266,7 @@ pub(crate) async fn rx_loop<F>(
     adapter: btleplug::platform::Adapter,
     topic_filter: Option<u8>,
     relay: bool,
+
 
     mut on_msg: F,
 ) -> anyhow::Result<()>
@@ -320,9 +333,9 @@ where
                             }
                         }
 
-                        let text = String::from_utf8_lossy(&bytes).to_string();
-                        on_msg(entry.2, f.msg_id, text.clone());
-
+                        let text = String::from_utf8_lossy(&bytes);
+                        let id8 = hex::encode(f.msg_id);
+                        println!("[topic {}] #{}: {}", entry.2, &id8[..8], text);
                         reasm.remove(&f.msg_id);
                     }
 
