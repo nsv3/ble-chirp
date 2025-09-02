@@ -9,14 +9,12 @@ use std::{
 };
 
 use anyhow::Context;
-use btleplug::api::{
-    AdvertisementData, AdvertisingOptions, Central, CentralEvent, Manager as _, Peripheral as _,
-    ScanFilter,
-};
+use btleplug::api::{Central, CentralEvent, Manager as _, ScanFilter};
 use btleplug::platform::Manager;
 use clap::{Parser, Subcommand};
 use rand::Rng;
 use tokio::time::sleep;
+use futures::StreamExt; // for events.next().await
 
 mod chat_ui;
 
@@ -185,9 +183,10 @@ async fn main() -> anyhow::Result<()> {
             ttl,
             msg,
             dwell_ms,
+            rate,
         } => {
             let topic = room.map_or(topic, |r| topic_from_room(&r));
-            tx(adapter, topic, ttl, &msg, dwell_ms).await?
+            tx(adapter, topic, ttl, &msg, dwell_ms, rate, key).await?
         }
         Cmd::Rx { topic, room, relay } => {
             let topic = match (topic, room) {
@@ -195,11 +194,11 @@ async fn main() -> anyhow::Result<()> {
                 (_, Some(r)) => Some(topic_from_room(&r)),
                 _ => None,
             };
-            rx(adapter, topic, relay).await?
+            rx(adapter, topic, relay, key).await?
         }
         Cmd::Chat { topic, room, ttl } => {
             let topic = room.map_or(topic, |r| topic_from_room(&r));
-            chat_ui::chat(adapter, topic, ttl).await?
+            chat_ui::chat(adapter, topic, ttl, key, 2.0).await?
         }
     }
     Ok(())
@@ -212,60 +211,78 @@ pub(crate) async fn tx(
     msg: &str,
     dwell_ms: u64,
     rate: f64,
+    key: Option<crypto::KeyBytes>,
 
 ) -> anyhow::Result<()> {
-    let msg_bytes = msg.as_bytes();
-    let chunks = chunk_message(msg_bytes);
-    let peripheral = adapter.peripheral().await.context("create peripheral")?;
-    let msg_id: [u8; 4] = rand::thread_rng().r#gen();
-    println!(
-        "TX topic={} ttl={} chunks={} msg_id={:02x?}",
-        topic,
-        ttl,
-        chunks.len(),
-        msg_id
-    );
+    #[cfg(target_os = "macos")]
+    {
+        anyhow::bail!(
+            "Advertising is not supported by btleplug on macOS. Use the Node sender below to test TX."
+        );
+    }
 
-    let mut rl = RateLimiter::new(rate);
-    for (seq, tot, payload) in chunks {
-        rl.acquire().await;
-        let f = Frame {
+    #[cfg(not(target_os = "macos"))]
+    {
+        let msg_bytes = msg.as_bytes();
+        let chunks = chunk_message(msg_bytes);
+        let peripheral = adapter.peripheral().await.context("create peripheral")?;
+        let msg_id = rand::random::<[u8; 4]>();
+        println!(
+            "TX topic={} ttl={} chunks={} msg_id={:02x?}",
             topic,
             ttl,
-            msg_id,
-            seq,
-            tot,
-            payload,
-        };
-        let md = pack_frame(&f);
-        let mut m = HashMap::new();
-        m.insert(COMPANY_ID, md);
+            chunks.len(),
+            msg_id
+        );
 
-        let adv = AdvertisementData {
-            local_name: Some("chirp".into()),
-            manufacturer_data: Some(m),
-            service_data: None,
-            services: None,
-            appearance: None,
-            tx_power_level: None,
-            solicited_services: None,
-        };
+        let mut rl = RateLimiter::new(rate);
+        for (seq, tot, mut payload) in chunks {
+            rl.acquire().await;
+            if let Some(ref k) = key {
+                payload = crypto::encrypt(k, &msg_id, seq, &payload)
+                    .context("encrypt payload")?;
+            }
+            let f = Frame {
+                topic,
+                ttl,
+                msg_id,
+                seq,
+                tot,
+                payload,
+            };
+            let md = pack_frame(&f);
+            let mut m = HashMap::new();
+            m.insert(COMPANY_ID, md);
 
-        peripheral
-            .start_advertising(adv, AdvertisingOptions::default())
-            .await?;
-        sleep(Duration::from_millis(dwell_ms)).await;
-        peripheral.stop_advertising().await?;
-        sleep(Duration::from_millis(60)).await; // small gap between chunks
+            use btleplug::api::{AdvertisementData, AdvertisingOptions};
+            peripheral
+                .start_advertising(
+                    AdvertisementData {
+                        local_name: Some("chirp".into()),
+                        manufacturer_data: Some(m),
+                        service_data: None,
+                        services: None,
+                        appearance: None,
+                        tx_power_level: None,
+                        solicited_services: None,
+                    },
+                    AdvertisingOptions::default(),
+                )
+                .await?;
+            sleep(Duration::from_millis(dwell_ms)).await;
+            peripheral.stop_advertising().await?;
+            sleep(Duration::from_millis(60)).await; // small gap between chunks
+        }
+        println!("Done.");
+        Ok(())
     }
-    println!("Done.");
-    Ok(())
 }
 
 pub(crate) async fn rx_loop<F>(
     adapter: btleplug::platform::Adapter,
     topic_filter: Option<u8>,
     relay: bool,
+    key: Option<crypto::KeyBytes>,
 
 
     mut on_msg: F,
@@ -287,7 +304,7 @@ where
     );
 
     let mut events = adapter.events().await?;
-    while let Some(evt) = events.recv().await {
+    while let Some(evt) = events.next().await {
         if let CentralEvent::ManufacturerDataAdvertisement {
             manufacturer_data, ..
         } = evt
@@ -318,7 +335,7 @@ where
                         }
                     }
 
-                    // reassembly
+                    // reassembly (using decrypted payload when available)
                     let entry = reasm
                         .entry(f.msg_id)
                         .or_insert_with(|| (f.tot, HashMap::new(), f.topic));
@@ -333,9 +350,8 @@ where
                             }
                         }
 
-                        let text = String::from_utf8_lossy(&bytes);
-                        let id8 = hex::encode(f.msg_id);
-                        println!("[topic {}] #{}: {}", entry.2, &id8[..8], text);
+                        let text = String::from_utf8_lossy(&bytes).to_string();
+                        on_msg(entry.2, f.msg_id, text);
                         reasm.remove(&f.msg_id);
                     }
 
@@ -356,8 +372,9 @@ async fn rx(
     adapter: btleplug::platform::Adapter,
     topic_filter: Option<u8>,
     relay: bool,
+    key: Option<crypto::KeyBytes>,
 ) -> anyhow::Result<()> {
-    rx_loop(adapter, topic_filter, relay, |topic, id, text| {
+    rx_loop(adapter, topic_filter, relay, key, |topic, id, text| {
         let id8 = hex::encode(id);
         println!("[topic {}] #{}: {}", topic, &id8[..8], text);
     })
@@ -365,32 +382,42 @@ async fn rx(
 }
 
 async fn do_relay(adapter: btleplug::platform::Adapter, f: Frame, backoff_ms: u64) {
-    sleep(Duration::from_millis(backoff_ms)).await;
-    let peripheral = match adapter.peripheral().await {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("relay peripheral err: {e}");
-            return;
-        }
-    };
-    let mut m = HashMap::new();
-    m.insert(COMPANY_ID, pack_frame(&f));
-    let adv = AdvertisementData {
-        local_name: Some("chirp".into()),
-        manufacturer_data: Some(m),
-        service_data: None,
-        services: None,
-        appearance: None,
-        tx_power_level: None,
-        solicited_services: None,
-    };
-    if let Err(e) = peripheral
-        .start_advertising(adv, AdvertisingOptions::default())
-        .await
+    #[cfg(target_os = "macos")]
     {
-        eprintln!("relay start adv err: {e}");
+        eprintln!("relay disabled: advertising not supported on macOS via btleplug");
         return;
     }
-    sleep(Duration::from_millis(300)).await;
-    let _ = peripheral.stop_advertising().await;
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        sleep(Duration::from_millis(backoff_ms)).await;
+        let peripheral = match adapter.peripheral().await {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("relay peripheral err: {e}");
+                return;
+            }
+        };
+        let mut m = HashMap::new();
+        m.insert(COMPANY_ID, pack_frame(&f));
+        use btleplug::api::{AdvertisementData, AdvertisingOptions};
+        let adv = AdvertisementData {
+            local_name: Some("chirp".into()),
+            manufacturer_data: Some(m),
+            service_data: None,
+            services: None,
+            appearance: None,
+            tx_power_level: None,
+            solicited_services: None,
+        };
+        if let Err(e) = peripheral
+            .start_advertising(adv, AdvertisingOptions::default())
+            .await
+        {
+            eprintln!("relay start adv err: {e}");
+            return;
+        }
+        sleep(Duration::from_millis(300)).await;
+        let _ = peripheral.stop_advertising().await;
+    }
 }

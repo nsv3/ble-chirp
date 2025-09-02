@@ -10,7 +10,13 @@ use ratatui::{backend::CrosstermBackend, prelude::*, widgets::*};
 
 use crate::{rx_loop, tx};
 
-pub async fn chat(adapter: btleplug::platform::Adapter, topic: u8, ttl: u8) -> anyhow::Result<()> {
+pub async fn chat(
+    adapter: btleplug::platform::Adapter,
+    topic: u8,
+    ttl: u8,
+    key: Option<crate::crypto::KeyBytes>,
+    rate: f64,
+) -> anyhow::Result<()> {
     enable_raw_mode()?;
     let mut out = stdout();
     execute!(out, EnterAlternateScreen)?;
@@ -21,8 +27,9 @@ pub async fn chat(adapter: btleplug::platform::Adapter, topic: u8, ttl: u8) -> a
 
     // spawn receiver
     let adapter_rx = adapter.clone();
+    let key_rx = key.clone();
     tokio::spawn(async move {
-        let _ = rx_loop(adapter_rx, Some(topic), true, move |t, id, text| {
+        let _ = rx_loop(adapter_rx, Some(topic), true, key_rx, move |t, id, text| {
             let _ = msg_tx.send((id, text, t));
         })
         .await;
@@ -65,8 +72,8 @@ pub async fn chat(adapter: btleplug::platform::Adapter, topic: u8, ttl: u8) -> a
         }
 
         if event::poll(Duration::from_millis(50))? {
-            if let CEvent::Key(key) = event::read()? {
-                match key.code {
+            if let CEvent::Key(kev) = event::read()? {
+                match kev.code {
                     KeyCode::Char(c) => input.push(c),
                     KeyCode::Backspace => {
                         input.pop();
@@ -74,8 +81,14 @@ pub async fn chat(adapter: btleplug::platform::Adapter, topic: u8, ttl: u8) -> a
                     KeyCode::Enter => {
                         let m = input.clone();
                         input.clear();
-                        tokio::spawn(tx(adapter.clone(), topic, ttl, &m, 500));
-                        messages.push(([0; 4], m, topic));
+                        // UI needs its own copy since we move `m` into the task
+                        let ui_copy = m.clone();
+                        let adapter_tx = adapter.clone();
+                        let key_tx = key.clone();
+                        tokio::spawn(async move {
+                            let _ = tx(adapter_tx, topic, ttl, &m, 500, rate, key_tx).await;
+                        });
+                        messages.push(([0; 4], ui_copy, topic));
                     }
                     KeyCode::Esc => break,
                     _ => {}
@@ -85,7 +98,7 @@ pub async fn chat(adapter: btleplug::platform::Adapter, topic: u8, ttl: u8) -> a
     }
 
     disable_raw_mode()?;
-    let mut out = terminal.into_inner();
+    let mut out = std::io::stdout();
     execute!(out, LeaveAlternateScreen)?;
     Ok(())
 }
