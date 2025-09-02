@@ -118,23 +118,45 @@ fn pack_frame(f: &Frame) -> Vec<u8> {
 }
 
 fn unpack_frame(md: &[u8]) -> Option<Frame> {
-    if md.len() < 2 + 1 + 1 + 1 + 4 + 1 + 1 {
+    // Accept both layouts:
+    // A) md = [VER,topic,ttl,msgId(4),seq,tot,payload...]
+    // B) md = [CID(2 LE), VER,topic,ttl,msgId(4),seq,tot,payload...]
+
+    let mut i = 0usize;
+
+    // If the first two bytes look like our company id, skip them.
+    if md.len() >= 2 {
+        let cid = u16::from_le_bytes([md[0], md[1]]);
+        if cid == COMPANY_ID {
+            i = 2;
+        }
+    }
+
+    // Need at least VER(1)+topic(1)+ttl(1)+msgId(4)+seq(1)+tot(1)
+    if md.len() < i + 1 + 1 + 1 + 4 + 1 + 1 {
         return None;
     }
-    let cid = u16::from_le_bytes([md[0], md[1]]);
-    if cid != COMPANY_ID {
-        return None;
-    }
-    let ver = md[2];
+
+    let ver = md[i];
     if ver != VER {
         return None;
     }
-    let topic = md[3];
-    let ttl = md[4];
-    let msg_id = [md[5], md[6], md[7], md[8]];
-    let seq = md[9];
-    let tot = md[10];
-    let payload = md[11..].to_vec();
+    i += 1;
+
+    let topic = md[i];
+    i += 1;
+    let ttl = md[i];
+    i += 1;
+
+    let msg_id = [md[i], md[i + 1], md[i + 2], md[i + 3]];
+    i += 4;
+
+    let seq = md[i];
+    i += 1;
+    let tot = md[i];
+    i += 1;
+
+    let payload = md[i..].to_vec();
     Some(Frame {
         topic,
         ttl,
