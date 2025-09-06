@@ -14,7 +14,7 @@ use btleplug::platform::Manager;
 use clap::{Parser, Subcommand};
 use rand::Rng;
 use tokio::time::sleep;
-use futures::StreamExt; // for events.next().await
+use futures::StreamExt;
 
 mod chat_ui;
 
@@ -23,9 +23,9 @@ mod crypto;
 mod rate_limiter;
 use rate_limiter::RateLimiter;
 
-const COMPANY_ID: u16 = 0xFFFF; // experimental/manufacturer data key
+const COMPANY_ID: u16 = 0xFFFF; // manufacturer data key
 const VER: u8 = 1;
-const MAX_PAYLOAD: usize = 20; // leave header room; BLE legacy adv ~31B total
+const MAX_PAYLOAD: usize = 20; 
 
 #[derive(Parser, Debug)]
 #[command(
@@ -33,7 +33,6 @@ const MAX_PAYLOAD: usize = 20; // leave header room; BLE legacy adv ~31B total
     about = "Broadcast/scan tiny messages via BLE advertising (mesh-style)"
 )]
 struct Args {
-    /// Which adapter index to use (0 by default)
     #[arg(long, default_value_t = 0)]
     adapter: usize,
     /// Passphrase for payload encryption/decryption
@@ -51,43 +50,32 @@ enum Cmd {
 
         #[arg(long, default_value_t = 7, conflicts_with = "room")]
         topic: u8,
-        /// Human-friendly room name
         #[arg(long)]
         room: Option<String>,
-        /// Hops to relay
         #[arg(long, default_value_t = 3)]
         ttl: u8,
-        /// Message text
         msg: String,
-        /// Milliseconds to advertise each chunk
         #[arg(long, default_value_t = 500)]
         dwell_ms: u64,
-        /// Max chunks per second
         #[arg(long, default_value_t = 2.0)]
         rate: f64,
     },
-    /// Receive & show messages; optionally relay them
     Rx {
-        /// Only show a specific topic
+
         #[arg(long, conflicts_with = "room")]
         topic: Option<u8>,
-        /// Human-friendly room name to filter by
         #[arg(long)]
         room: Option<String>,
-        /// Relay chunks with TTL-1 (gossip)
         #[arg(long, default_value_t = true)]
         relay: bool,
     },
 
-    /// Interactive terminal UI chat mode
+
     Chat {
-        /// Topic/channel (0-255)
         #[arg(long, default_value_t = 7, conflicts_with = "room")]
         topic: u8,
-        /// Human-friendly room name
         #[arg(long)]
         room: Option<String>,
-        /// Hops to relay for our sent messages
         #[arg(long, default_value_t = 3)]
         ttl: u8,
     },
@@ -104,7 +92,6 @@ struct Frame {
 }
 
 fn pack_frame(f: &Frame) -> Vec<u8> {
-    // CompanyID(2 LE) + ver(1)+topic(1)+ttl(1)+msgId(4)+seq(1)+tot(1)+payload
     let mut b = Vec::with_capacity(2 + 1 + 1 + 1 + 4 + 1 + 1 + f.payload.len());
     b.extend_from_slice(&COMPANY_ID.to_le_bytes());
     b.push(VER);
@@ -118,13 +105,9 @@ fn pack_frame(f: &Frame) -> Vec<u8> {
 }
 
 fn unpack_frame(md: &[u8]) -> Option<Frame> {
-    // Accept both layouts:
-    // A) md = [VER,topic,ttl,msgId(4),seq,tot,payload...]
-    // B) md = [CID(2 LE), VER,topic,ttl,msgId(4),seq,tot,payload...]
 
     let mut i = 0usize;
 
-    // If the first two bytes look like our company id, skip them.
     if md.len() >= 2 {
         let cid = u16::from_le_bytes([md[0], md[1]]);
         if cid == COMPANY_ID {
@@ -132,7 +115,6 @@ fn unpack_frame(md: &[u8]) -> Option<Frame> {
         }
     }
 
-    // Need at least VER(1)+topic(1)+ttl(1)+msgId(4)+seq(1)+tot(1)
     if md.len() < i + 1 + 1 + 1 + 4 + 1 + 1 {
         return None;
     }
@@ -168,7 +150,6 @@ fn unpack_frame(md: &[u8]) -> Option<Frame> {
 }
 
 fn chunk_message(bytes: &[u8]) -> Vec<(u8, u8, Vec<u8>)> {
-    // returns (seq, tot, payload)
     let tot = ((bytes.len() + MAX_PAYLOAD - 1) / MAX_PAYLOAD).max(1) as u8;
     let mut v = Vec::new();
     for i in 0..tot {
@@ -293,7 +274,7 @@ pub(crate) async fn tx(
                 .await?;
             sleep(Duration::from_millis(dwell_ms)).await;
             peripheral.stop_advertising().await?;
-            sleep(Duration::from_millis(60)).await; // small gap between chunks
+            sleep(Duration::from_millis(60)).await; 
         }
         println!("Done.");
         Ok(())
@@ -312,10 +293,10 @@ pub(crate) async fn rx_loop<F>(
 where
     F: FnMut(u8, [u8; 4], String) + Send + 'static,
 {
-    // de-dupe cache: seen (msg_id, seq)
+    
     let mut seen: VecDeque<([u8; 4], u8)> = VecDeque::with_capacity(2048);
     let mut reasm: HashMap<[u8; 4], (u8, HashMap<u8, Vec<u8>>, u8)> = HashMap::new();
-    //                               tot,    parts(seq->payload), topic
+    
 
     adapter.start_scan(ScanFilter::default()).await?;
     println!(
@@ -339,7 +320,7 @@ where
                         }
                     }
 
-                    // de-dupe (msg_id, seq)
+                    
                     if seen.iter().any(|(id, s)| *id == f.msg_id && *s == f.seq) {
                         continue;
                     }
@@ -348,7 +329,7 @@ where
                     }
                     seen.push_back((f.msg_id, f.seq));
 
-                    // decrypt if needed
+                    
                     let mut payload = f.payload.clone();
                     if let Some(ref k) = key {
                         match crypto::decrypt(k, &f.msg_id, f.seq, &f.payload) {
@@ -357,13 +338,13 @@ where
                         }
                     }
 
-                    // reassembly (using decrypted payload when available)
+                    
                     let entry = reasm
                         .entry(f.msg_id)
                         .or_insert_with(|| (f.tot, HashMap::new(), f.topic));
                     entry.1.insert(f.seq, payload);
 
-                    // complete?
+                    
                     if entry.1.len() as u8 == entry.0 {
                         let mut bytes = Vec::new();
                         for i in 0..entry.0 {
@@ -377,10 +358,10 @@ where
                         reasm.remove(&f.msg_id);
                     }
 
-                    // relay
+                    
                     if relay && f.ttl > 0 {
                         f.ttl -= 1;
-                        let backoff = 100 + rand::thread_rng().gen_range(0..400); // 100–500ms
+                        let backoff = 100 + rand::thread_rng().gen_range(0..400); 
                         tokio::spawn(do_relay(adapter.clone(), f, backoff));
                     }
                 }
