@@ -77,9 +77,9 @@ async function main() {
     bleno.startAdvertising('chirp', [], { manufacturerData: frame }, err => {
       if (err) console.error('adv err', err);
     });
-    await new Promise(r => setTimeout(r, 5000)); 
+    await new Promise(r => setTimeout(r, 10000)); 
     bleno.stopAdvertising();
-    await new Promise(r => setTimeout(r, 80));  // small gap
+    await new Promise(r => setTimeout(r, 80));
   }
   console.log('done');
   process.exit(0);
